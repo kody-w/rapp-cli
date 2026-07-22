@@ -1,24 +1,184 @@
-# RAPP Cli
+# RAPP CLI
 
-> The RAPP CLI is the terminal control surface for RAPP: launch a Brainstem, fly a ring, drive a twin, all from the command line.
+The headless terminal control surface for RAPP. It operates an existing
+Brainstem provider, chats through that provider's `/chat` endpoint, manages
+integrity-checked agent cartridges, inspects release-train observations, and
+reports unavailable ecosystem surfaces honestly.
 
-One command line, the whole platform.
+The CLI is a client and control plane. It does not vendor or modify
+[`kody-w/rapp-installer`](https://github.com/kody-w/rapp-installer), execute ring
+installers, or invent lifecycle behavior for specification-only products.
 
----
+## Install
 
-Part of the **RAPP** platform — the Rapid Agent Prototype Platform.
-Explore the ecosystem: [Installer](https://github.com/kody-w/rapp-installer) ·
-[Flight Deck](https://github.com/kody-w/rapp-flight-deck) ·
-[Rings](https://github.com/kody-w/rapp-rings) ·
-[Twin](https://github.com/kody-w/rapp-twin)
+Python 3.11 or newer is required.
 
-## Status
+```console
+pipx install git+https://github.com/kody-w/rapp-cli.git
+```
 
-Early, and actively being built out. Interfaces will move.
+After the first package release, `pipx install rapp-cli` installs from PyPI.
+
+From a checkout:
+
+```console
+python3.13 -m venv .venv
+.venv/bin/pip install -e .
+.venv/bin/rapp --version
+```
+
+The Brainstem remains independently installed. `rapp launch` runs a detected
+Brainstem-compatible layout in the foreground; it never installs or updates it.
+
+## Quickstart
+
+```console
+# Read-only shallow probe. /version does not load agent cartridges.
+rapp status
+
+# Run an already-installed Brainstem in the foreground.
+rapp launch
+
+# One-shot, piped, streaming, or interactive chat.
+rapp chat "What agents are available?"
+printf 'Reply only with ok' | rapp chat
+rapp chat --stream "Explain the current workspace"
+rapp --jsonl chat --stream "Explain the current workspace"
+rapp chat
+
+# Machine-readable output: global flags precede the command.
+rapp --json status
+```
+
+## Commands
+
+| Command | Purpose |
+|---|---|
+| `rapp status` | Probe `/version` without loading agents |
+| `rapp doctor [--offline\|--deep]` | Diagnose Python, configuration, and Brainstem reachability |
+| `rapp capabilities` | Report implemented, read-only, and unavailable surfaces |
+| `rapp launch` | Run a detected Brainstem-compatible layout in the foreground |
+| `rapp brainstem locate` | Show the detected compatible layout, source, and Python |
+| `rapp brainstem run` | Explicit form of `rapp launch` |
+| `rapp brainstem health` | Deep `/health` inspection; may import installed agents |
+| `rapp brainstem version` | Read the runtime version |
+| `rapp chat [MESSAGE...]` | Use `/chat` or `/chat/stream`; no message reads stdin or starts a REPL |
+| `rapp auth status\|login\|poll\|retry\|switch` | Operate Brainstem device-code authentication |
+| `rapp model list\|set` | Inspect or select the Brainstem model |
+| `rapp agent list` | List installed files; Brainstem may import cartridges |
+| `rapp agent import\|export\|remove` | Manage local `*_agent.py` cartridges |
+| `rapp agent search\|info\|install` | Use the CLI's integrity-pinned RAR compatibility snapshot |
+| `rapp ring list\|status` | Inspect read-only release-train metadata observations |
+| `rapp ring fly` | Fails explicitly until a sandbox contract is published |
+| `rapp twin legacy-list\|legacy-show` | Inspect historical `~/.rapp/twins` layouts without calling them canonical |
+| `rapp twin drive` | Fails explicitly until a canonical Twin runtime exists |
+| `rapp config path\|show` | Show resolved, non-secret configuration |
+
+Run `rapp <command> --help` for command-specific options.
+
+## Configuration
+
+Precedence is command flags, `RAPP_*` environment variables, the user config
+file, then built-in defaults.
+
+Default config location:
+
+- Unix: `${XDG_CONFIG_HOME:-~/.config}/rapp/config.json`
+- Windows: `%APPDATA%\rapp\config.json`
+- Override: `RAPP_CONFIG_FILE`
+
+Supported config:
+
+```json
+{
+  "brainstem_url": "http://127.0.0.1:7071",
+  "timeout": 30,
+  "brainstem_secret_file": "~/.brainstem/src/rapp_brainstem/.brainstem_secret"
+}
+```
+
+Environment equivalents:
+
+| Variable | Meaning |
+|---|---|
+| `RAPP_ENDPOINT` / `RAPP_BRAINSTEM_URL` | Brainstem base URL |
+| `RAPP_TIMEOUT` | Request timeout |
+| `RAPP_BRAINSTEM_SECRET` | LAN secret |
+| `RAPP_BRAINSTEM_SECRET_FILE` | Preferred path to a mode-`0600` secret |
+| `RAPP_BRAINSTEM_HOME` | Brainstem-compatible installation root |
+| `RAPP_TWINS_HOME` | Local twin workspace root |
+| `RAPP_RELEASE_TRAIN_URL` | Release-train static API override |
+
+Plaintext HTTP is accepted automatically only on loopback. A non-loopback HTTP
+endpoint requires `--allow-insecure-http`; HTTPS is preferred.
+
+## Machine output
+
+`--json` emits exactly one `rapp-cli-result/1.0` or
+`rapp-cli-error/1.0` document on stdout. Streaming commands use `--jsonl` and
+emit `rapp-cli-event/1.0` records.
+
+```json
+{
+  "schema": "rapp-cli-result/1.0",
+  "ok": true,
+  "command": "status",
+  "data": {},
+  "warnings": [],
+  "meta": {"cli_version": "0.1.0"}
+}
+```
+
+Exit codes are stable:
+
+| Code | Meaning |
+|---:|---|
+| `0` | Success |
+| `1` | Domain operation failure |
+| `2` | Invalid usage or configuration |
+| `3` | Capability is not published |
+| `4` | Missing installation, connection failure, or timeout |
+| `5` | Authentication or Copilot entitlement failure |
+| `6` | Conflict or confirmation required |
+| `7` | Upstream protocol or operation failure |
+| `8` | Integrity or security refusal |
+| `70` | Unexpected internal CLI failure |
+| `130` | Interrupted |
+
+## Trust and safety
+
+- HTTP redirects are refused, response sizes are bounded, and non-loopback
+  plaintext HTTP is opt-in.
+- Secrets are never accepted as command-line values or printed by `config show`.
+- `status` probes only `/version`. `/health`, `agent list`, and agent imports can
+  cause Brainstem to import cartridge Python and are explicit commands.
+- Local imports require a regular non-symlink `*_agent.py`, optional full
+  SHA-256 verification, and `--yes`.
+- RAR installs use a CLI compatibility pin matching the inspected Brainstem
+  revision, verify the registry's full SHA-256, and provide integrity rather
+  than identity or RAPP/1 trust.
+- Ring operations are read-only. The CLI never executes downloaded installer
+  text or promotes a release.
+- Legacy Twin inspection never imports or executes files and never mutates
+  lifecycle directories. Canonical Twin driving remains unavailable.
+
+See [SECURITY.md](SECURITY.md) for the security boundary.
+
+## Development
+
+```console
+python3.13 -m venv .venv
+.venv/bin/pip install -e '.[test]'
+.venv/bin/pytest -q
+.venv/bin/ruff check .
+.venv/bin/ruff format --check .
+.venv/bin/python -m build
+```
+
+Tests use local fixture servers and never call live inference.
 
 ## License
 
-Released under the MIT License.
-
-<sub>RAPP, RAPP Brainstem, Twin in Residence, RAPP Flight Deck, and the RAPP family of
-names are trademarks of the RAPP project. First published 2026-07-18 as part of the RAPP ecosystem.</sub>
+Code is released under the MIT License. RAPP and related names remain
+trademarks of the RAPP project; see [LICENSE](LICENSE) and
+[DISCLAIMER.md](DISCLAIMER.md).
