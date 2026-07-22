@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 from contextlib import contextmanager
@@ -219,3 +220,67 @@ def test_oversized_json_request_is_rejected_before_network():
         make_client(url).post_json("/chat", {"user_input": "x" * (1024 * 1024)})
 
     assert Handler.requests == []
+
+
+def test_exactly_16_mib_agent_payload_is_rejected_for_multipart_overhead(monkeypatch):
+    requests = []
+    client = make_client("http://127.0.0.1:1")
+    monkeypatch.setattr(client_module.secrets, "token_hex", lambda _length: "0" * 32)
+    monkeypatch.setattr(
+        client,
+        "request",
+        lambda *args, **kwargs: requests.append((args, kwargs)),
+    )
+
+    with pytest.raises(UsageError, match="16 MiB"):
+        client.import_agent(
+            "large_agent.py",
+            b"x" * (16 * 1024 * 1024),
+            sha256=hashlib.sha256(b"x").hexdigest(),
+        )
+
+    assert requests == []
+
+
+def test_largest_agent_payload_accounts_for_exact_multipart_overhead(monkeypatch):
+    requests = []
+    client = make_client("http://127.0.0.1:1")
+    monkeypatch.setattr(client_module.secrets, "token_hex", lambda _length: "0" * 32)
+
+    def capture_request(method, path, **kwargs):
+        requests.append((method, path, kwargs))
+        return client_module.Response(status=200, headers={}, body=b"{}")
+
+    monkeypatch.setattr(client, "request", capture_request)
+    monkeypatch.setattr(client_module, "_MAX_AGENT_BYTES", 1024 * 1024)
+    client.import_agent(
+        "boundary_agent.py",
+        b"",
+        sha256="a" * 64,
+        source_revision="revision",
+    )
+    overhead = len(requests[-1][2]["body"])
+    requests.clear()
+
+    accepted_payload = b"x" * 32
+    monkeypatch.setattr(
+        client_module,
+        "_MAX_AGENT_BYTES",
+        overhead + len(accepted_payload),
+    )
+    client.import_agent(
+        "boundary_agent.py",
+        accepted_payload,
+        sha256="a" * 64,
+        source_revision="revision",
+    )
+
+    assert len(requests[-1][2]["body"]) == overhead + len(accepted_payload)
+    with pytest.raises(UsageError, match="complete agent multipart request"):
+        client.import_agent(
+            "boundary_agent.py",
+            accepted_payload + b"x",
+            sha256="a" * 64,
+            source_revision="revision",
+        )
+    assert len(requests) == 1

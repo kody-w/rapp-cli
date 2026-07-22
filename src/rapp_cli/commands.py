@@ -17,6 +17,12 @@ from json import JSONDecodeError
 from pathlib import Path
 from typing import Any
 
+from .agent_files import (
+    read_agent_source as _read_agent_source,
+)
+from .agent_files import (
+    validate_agent_filename as _agent_filename,
+)
 from .client import BrainstemClient
 from .config import Config
 from .errors import (
@@ -30,13 +36,15 @@ from .errors import (
     RemoteFailure,
     UsageError,
 )
-from .filesystem import is_reparse_point
 from .jsonio import DuplicateKeyError, NonFiniteNumberError, loads
 from .output import Output
+from .provider import raise_provider_error as _raise_provider_error
+from .provider import require_provider_success
 from .rar import RAR_REVISION, RarClient, installability
 from .release_train import RINGS, ReleaseTrainClient
 from .runtime import locate_brainstem, run_brainstem
-from .twins import list_twins, show_twin
+from .twin_hatch import hatch_twin as hatch_local_twin
+from .twins import default_twins_home, list_twins, show_twin
 
 _MAX_HISTORY_BYTES = 1024 * 1024
 _MAX_CHAT_BYTES = 1024 * 1024
@@ -481,41 +489,6 @@ def agent_list(ctx: Context, _args: Any) -> Result:
     return Result(payload, "\n".join(lines))
 
 
-_AGENT_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*_agent\.py$")
-_MAX_AGENT_BYTES = 16 * 1024 * 1024
-
-
-def _agent_filename(value: str) -> str:
-    if not _AGENT_FILENAME_RE.fullmatch(value):
-        raise UsageError(
-            "agent filename must be a basename ending in _agent.py "
-            "and contain only letters, numbers, dot, underscore, or hyphen"
-        )
-    return value
-
-
-def _read_agent_source(source: Path) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        if is_reparse_point(source):
-            raise UsageError(f"agent file {source} must not be a reparse point")
-        fd = os.open(source, flags)
-    except UsageError:
-        raise
-    except OSError as exc:
-        raise UsageError(f"cannot open agent file {source}: {exc}") from exc
-    with os.fdopen(fd, "rb") as handle:
-        info = os.fstat(handle.fileno())
-        if not stat_module.S_ISREG(info.st_mode):
-            raise UsageError(f"agent path must be a regular file: {source}")
-        if info.st_size > _MAX_AGENT_BYTES:
-            raise UsageError("agent file exceeds the Brainstem 16 MiB upload limit")
-        payload = handle.read(_MAX_AGENT_BYTES + 1)
-    if len(payload) > _MAX_AGENT_BYTES:
-        raise UsageError("agent file exceeds the Brainstem 16 MiB upload limit")
-    return payload
-
-
 def agent_import(ctx: Context, args: Any) -> Result:
     if not args.yes:
         raise ConfirmationRequired(
@@ -539,9 +512,7 @@ def agent_import(ctx: Context, args: Any) -> Result:
         sha256=args.sha256,
         source_revision=None,
     )
-    if not isinstance(payload, dict):
-        raise RemoteFailure("Brainstem agent import response must be a JSON object")
-    _raise_provider_error(payload)
+    require_provider_success(payload, "agent import")
     return Result(payload, f"imported {source.name}")
 
 
@@ -619,9 +590,7 @@ def agent_remove(ctx: Context, args: Any) -> Result:
     if not args.yes:
         raise ConfirmationRequired("agent removal requires --yes")
     payload = ctx.client.remove_agent(filename)
-    if not isinstance(payload, dict):
-        raise RemoteFailure("Brainstem agent removal response must be a JSON object")
-    _raise_provider_error(payload)
+    require_provider_success(payload, "agent removal")
     return Result(payload, f"removed {filename}")
 
 
@@ -697,9 +666,7 @@ def agent_install(ctx: Context, args: Any) -> Result:
         sha256=digest,
         source_revision=RAR_REVISION,
     )
-    if not isinstance(payload, dict):
-        raise RemoteFailure("Brainstem agent import response must be a JSON object")
-    _raise_provider_error(payload)
+    require_provider_success(payload, "agent import")
     data = {
         "name": args.name,
         "filename": filename,
@@ -708,17 +675,6 @@ def agent_install(ctx: Context, args: Any) -> Result:
         "brainstem": payload,
     }
     return Result(data, f"installed {args.name} as {filename}")
-
-
-def _raise_provider_error(payload: Any) -> None:
-    if not isinstance(payload, dict):
-        return
-    error = payload.get("error")
-    if isinstance(error, str) and error:
-        raise RemoteFailure(error)
-    if isinstance(error, dict):
-        message = error.get("message") or error.get("code") or "Brainstem operation failed"
-        raise RemoteFailure(str(message))
 
 
 def doctor(ctx: Context, args: Any) -> Result:
@@ -820,10 +776,11 @@ def capabilities(ctx: Context, _args: Any) -> Result:
             "commands": ["list", "status"],
         },
         "twin": {
-            "implementation": "spec_only",
-            "provider": "kody-w/rapp-twin",
-            "installed": False,
-            "commands": [],
+            "implementation": "local_folder_hatch",
+            "provider": "rapp-cli",
+            "installed": True,
+            "commands": ["hatch", "list", "show"],
+            "unavailable_commands": ["drive"],
             "legacy_commands": ["legacy-list", "legacy-show"],
         },
         "rar": {
@@ -847,9 +804,10 @@ def capabilities(ctx: Context, _args: Any) -> Result:
 
 
 def unavailable_capability(_ctx: Context, args: Any) -> Result:
+    capability = getattr(args, "capability", args.command)
     raise CapabilityUnavailable(
-        f"{args.command} is not published as an executable RAPP capability yet",
-        details={"capability": args.command},
+        f"{capability} is not published as an executable RAPP capability yet",
+        details={"capability": capability},
     )
 
 
@@ -928,13 +886,27 @@ def ring_status(ctx: Context, args: Any) -> Result:
     )
 
 
+def twin_hatch(ctx: Context, args: Any) -> Result:
+    outcome = hatch_local_twin(
+        ctx.client,
+        args.folder,
+        home=args.home or default_twins_home(),
+        endpoint=ctx.config.brainstem_url,
+        confirmed=args.yes,
+    )
+    return Result(outcome.to_dict(), outcome.message())
+
+
 def twin_list(_ctx: Context, args: Any) -> Result:
     twins = list_twins(args.home, include_archived=args.all)
     data = [twin.to_dict() for twin in twins]
     lines = [f"{twin.id}: {twin.name or twin.rappid or 'unnamed'} [{twin.state}]" for twin in twins]
+    legacy = args.twin_command.startswith("legacy-")
     return Result(
-        {"legacy": True, "twins": data},
-        "\n".join(lines) if lines else "no legacy local twins found",
+        {"legacy": legacy, "twins": data},
+        "\n".join(lines)
+        if lines
+        else ("no legacy local twins found" if legacy else "no local twins found"),
     )
 
 

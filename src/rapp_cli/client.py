@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import secrets
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from .agent_files import MAX_AGENT_BYTES, validate_agent_filename
 from .config import Config
 from .errors import (
     AuthenticationFailure,
@@ -23,7 +25,7 @@ from .jsonio import DuplicateKeyError, NonFiniteNumberError, loads
 _MAX_SSE_LINE_BYTES = 1024 * 1024
 _MAX_SSE_EVENT_BYTES = 4 * 1024 * 1024
 _MAX_JSON_BYTES = 4 * 1024 * 1024
-_MAX_AGENT_BYTES = 16 * 1024 * 1024
+_MAX_AGENT_BYTES = MAX_AGENT_BYTES
 _MAX_ERROR_BYTES = 64 * 1024
 _MAX_JSON_REQUEST_BYTES = 1024 * 1024
 
@@ -154,6 +156,11 @@ class BrainstemClient:
         sha256: str | None = None,
         source_revision: str | None = None,
     ) -> Any:
+        filename = validate_agent_filename(filename)
+        if sha256 is not None:
+            if not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
+                raise UsageError("agent SHA-256 must contain exactly 64 hexadecimal characters")
+            sha256 = sha256.lower()
         boundary = f"rapp-cli-{secrets.token_hex(16)}"
         parts: list[bytes] = []
 
@@ -183,6 +190,9 @@ class BrainstemClient:
                 f"--{boundary}--\r\n".encode(),
             ]
         )
+        multipart_bytes = sum(len(part) for part in parts)
+        if multipart_bytes > _MAX_AGENT_BYTES:
+            raise UsageError("complete agent multipart request exceeds the Brainstem 16 MiB limit")
         return self.request(
             "POST",
             "/agents/import",

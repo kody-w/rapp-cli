@@ -326,6 +326,17 @@ def test_agent_import(monkeypatch, tmp_path, capsys):
     assert "imported hello_agent.py" in capsys.readouterr().out
 
 
+def test_agent_import_rejects_non_ok_status(monkeypatch, tmp_path, capsys):
+    source = tmp_path / "hello_agent.py"
+    source.write_text("class HelloAgent: pass\n", encoding="utf-8")
+    argv = run(monkeypatch, tmp_path, "agent", "import", str(source), "--yes")
+    FakeClient.responses["/agents/import"] = {"status": "pending"}
+
+    assert cli.main(argv) == 7
+
+    assert "non-ok status" in capsys.readouterr().err
+
+
 def test_agent_import_requires_confirmation(monkeypatch, tmp_path, capsys):
     source = tmp_path / "hello_agent.py"
     source.write_text("class HelloAgent: pass\n", encoding="utf-8")
@@ -444,6 +455,22 @@ def test_agent_remove_requires_confirmation(monkeypatch, tmp_path, capsys):
     assert cli.main(argv) == 6
 
     assert "requires --yes" in capsys.readouterr().err
+
+
+def test_agent_remove_rejects_non_ok_status(monkeypatch, tmp_path, capsys):
+    argv = run(
+        monkeypatch,
+        tmp_path,
+        "agent",
+        "remove",
+        "hello_agent.py",
+        "--yes",
+    )
+    FakeClient.responses["/agents/remove"] = {"status": "pending"}
+
+    assert cli.main(argv) == 7
+
+    assert "non-ok status" in capsys.readouterr().err
 
 
 def test_config_show_never_prints_secret(monkeypatch, tmp_path, capsys):

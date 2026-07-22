@@ -3,7 +3,8 @@
 The headless terminal control surface for RAPP. It operates an existing
 Brainstem provider, chats through that provider's `/chat` endpoint, manages
 integrity-checked agent cartridges, inspects release-train observations, and
-reports unavailable ecosystem surfaces honestly.
+materializes already-prepared local Twin folders, and reports unavailable
+ecosystem surfaces honestly.
 
 The CLI is a client and control plane. It does not vendor or modify
 [`kody-w/rapp-installer`](https://github.com/kody-w/rapp-installer), execute ring
@@ -48,6 +49,10 @@ rapp chat
 
 # Machine-readable output: global flags precede the command.
 rapp --json status
+
+# Hatch an already identity-bearing local Twin folder.
+rapp twin hatch FOLDER --yes
+rapp twin list
 ```
 
 ## Commands
@@ -70,11 +75,103 @@ rapp --json status
 | `rapp agent search\|info\|install` | Use the CLI's integrity-pinned RAR compatibility snapshot |
 | `rapp ring list\|status` | Inspect read-only release-train metadata observations |
 | `rapp ring fly` | Fails explicitly until a sandbox contract is published |
-| `rapp twin legacy-list\|legacy-show` | Inspect historical `~/.rapp/twins` layouts without calling them canonical |
-| `rapp twin drive` | Fails explicitly until a canonical Twin runtime exists |
+| `rapp twin hatch FOLDER --yes [--home PATH]` | Materialize a prepared local Twin and register its agents |
+| `rapp twin list\|show` | Safely inspect local Twin workspaces |
+| `rapp twin legacy-list\|legacy-show` | Preserved aliases for historical local inspection |
+| `rapp twin drive` | Fails explicitly; direct Twin driving is not implemented |
 | `rapp config path\|show` | Show resolved, non-secret configuration |
 
 Run `rapp <command> --help` for command-specific options.
+
+## Twin hatch
+
+`rapp twin hatch` **consumes** an already identity-bearing folder. It never
+mints an identity, rewrites a rappid, reparents ancestry, scrapes or synthesizes
+writings, or invents an egg-producer format. The minimum folder is:
+
+```text
+FOLDER/
+├── rappid.json
+├── soul.md
+└── agents/
+    └── example_agent.py
+```
+
+`rappid.json` must be a strict JSON object with `schema: "rapp/1"`, `kind:
+"twin"` or `"organism"`, and a canonical
+`rappid:@owner/slug:<64 lowercase hex>`. Optional `name` and `display_name`
+values must be strings. Owner and slug are lowercase alphanumeric labels with
+single interior hyphens only; owner is at most 39 characters and slug at most
+100. `soul.md` must be non-empty UTF-8 text. `agents/` must contain at least
+one immediate regular, non-symlink `*_agent.py` file, with no filenames that
+collide under Unicode case folding. Additional safe files and
+directories—including `frames/`, memory, provenance, and documentation—are
+preserved byte-for-byte.
+
+Because every bundled agent is executable Python when Brainstem imports it,
+`--yes` is mandatory and is checked before the CLI reads the folder or contacts
+Brainstem. The source is treated only as data by the CLI; the CLI never imports
+agent modules itself.
+
+The 64-hex rappid tail becomes the directory name under
+`${RAPP_TWINS_HOME:-~/.rapp/twins}` (or `--home`). Hatching:
+
+1. rejects symlinks, reparse points, special files, unsafe relative names,
+   `.lineage_key`, `.copilot_token`, `.env`, and any `private` path component;
+2. rejects any overlap where source, Twin home, or target contains another;
+3. limits the folder to 4,096 files, 4,096 directories, 16 MiB per file, and
+   256 MiB total;
+4. hashes sorted normalized relative paths, entry types, and exact file bytes
+   into a deterministic source-tree SHA-256;
+5. copies into a private sibling staging directory, fsyncs where supported,
+   and atomically installs without overwriting;
+6. records a CLI-private receipt at
+   `<home>/.receipts/<source-tree-sha256>.json`.
+
+Overlap checks compare device/inode identity for existing paths and their
+nearest existing ancestors, so case-variant aliases and nonexistent
+descendants cannot bypass containment checks on case-insensitive filesystems.
+An existing target is accepted only when its complete safe-tree digest is
+identical. Receipts are not runtime inputs and `.receipts` is never listed as a
+Twin. Agent filenames are capped at 255 ASCII bytes, and the generated receipt
+is checked against a 2 MiB bound before local materialization; that bound
+covers the maximum 4,096-agent shape, so every generated receipt remains
+readable on retry. A per-identity advisory lock under `<home>/.locks/`
+serializes cooperating `rapp-cli` hatch processes.
+
+Local materialization and its receipt complete before provider registration.
+The CLI then queries `/agents`. A filename collision is matched
+case-insensitively; case-only spelling differences are conflicts, while exact
+spelling, identical SHA-256, and at least one loaded agent name is reported as
+`existing`. An existing file with an empty `agents` list remains a clear
+provider failure. Missing agents are uploaded with their full SHA-256,
+exported again, and followed by a fresh `/agents` query. They are reported as
+`imported` only after exact post-import hash verification, an absent or `ok`
+provider status, and a non-empty valid loaded-agent list.
+
+Brainstem exposes unconditional import/delete routes without an ETag or
+revision precondition. Therefore provider registration cannot be globally
+atomic against non-CLI writers. If registration fails, the complete local
+Twin, local-only receipt, and any provider files already imported remain for an
+idempotent retry; hatch never automatically deletes an agent. The advisory
+lock coordinates this CLI only and cannot constrain other Brainstem clients.
+A retained byte-identical file that still fails to load remains a failure on
+retry rather than being accepted as `existing`.
+
+JSON results identify the `twin.hatch` command and include the endpoint plus
+each agent's status, but never include soul text, agent source, secrets, or
+arbitrary contact metadata. The live Brainstem discovers imported agents on
+its next request, so no restart is required. Hatching does not select or force
+an agent through `/chat`.
+
+Secure source traversal uses verified directory descriptors, handle-relative
+no-follow opens, deterministic ordering, and device/inode revalidation. Python
+does not expose an equivalent guarantee on Windows, so Twin hatch currently
+fails closed there rather than following a possible reparse-point swap.
+
+`.egg` consumption, source adapters, summon/mint workflows, and direct Twin
+driving are not yet implemented. `rapp twin drive` remains explicitly
+unavailable.
 
 ## Configuration
 
@@ -154,13 +251,16 @@ Exit codes are stable:
   cause Brainstem to import cartridge Python and are explicit commands.
 - Local imports require a regular non-symlink `*_agent.py`, optional full
   SHA-256 verification, and `--yes`.
+- Twin hatch applies bounded no-link tree validation, preserves safe bytes,
+  installs transactionally, and requires exact local and Brainstem hashes for
+  idempotency.
 - RAR installs use a CLI compatibility pin matching the inspected Brainstem
   revision, verify the registry's full SHA-256, and provide integrity rather
   than identity or RAPP/1 trust.
 - Ring operations are read-only. The CLI never executes downloaded installer
   text or promotes a release.
-- Legacy Twin inspection never imports or executes files and never mutates
-  lifecycle directories. Canonical Twin driving remains unavailable.
+- Twin inspection never imports or executes files and never mutates lifecycle
+  directories. Direct Twin driving remains unavailable.
 
 See [SECURITY.md](SECURITY.md) for the security boundary.
 

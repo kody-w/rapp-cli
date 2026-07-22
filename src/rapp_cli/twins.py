@@ -10,6 +10,7 @@ from typing import Any
 
 from .errors import NotFound, UsageError
 from .filesystem import is_reparse_point
+from .identity import is_canonical_rappid
 from .jsonio import DuplicateKeyError, NonFiniteNumberError, loads
 
 _TWIN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,255}$")
@@ -135,7 +136,7 @@ def show_twin(
     *,
     include_archived: bool = False,
 ) -> Twin:
-    if not _TWIN_ID_RE.fullmatch(twin_id):
+    if not (_TWIN_ID_RE.fullmatch(twin_id) or is_canonical_rappid(twin_id)):
         raise UsageError("twin id contains unsupported characters")
     for twin in list_twins(home, include_archived=include_archived):
         if twin.id == twin_id or twin.rappid == twin_id:

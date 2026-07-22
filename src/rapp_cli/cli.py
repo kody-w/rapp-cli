@@ -37,13 +37,15 @@ from .commands import (
     ring_list,
     ring_status,
     status,
+    twin_hatch,
     twin_list,
     twin_show,
     unavailable_capability,
 )
 from .config import Config
-from .errors import InternalFailure, RappError, UsageError
+from .errors import ConfirmationRequired, InternalFailure, RappError, UsageError
 from .output import Output
+from .twin_hatch import HATCH_CONFIRMATION_MESSAGE
 
 
 class _ArgumentParser(argparse.ArgumentParser):
@@ -245,8 +247,50 @@ def _parser() -> argparse.ArgumentParser:
     )
     ring_fly_parser.add_argument("ring", choices=["canary", "nightly", "alpha", "beta"])
     ring_fly_parser.set_defaults(handler=unavailable_capability)
-    twin_parser = subcommands.add_parser("twin", help="inspect Twin capability status")
+    twin_parser = subcommands.add_parser("twin", help="hatch and inspect local Twins")
     twin_commands = twin_parser.add_subparsers(dest="twin_command", required=True)
+    twin_hatch_parser = twin_commands.add_parser(
+        "hatch",
+        help="materialize a prepared local Twin and register its agents",
+    )
+    twin_hatch_parser.add_argument(
+        "folder",
+        metavar="FOLDER",
+        help="prepared local Twin folder",
+    )
+    twin_hatch_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="confirm copying and registering executable agent Python",
+    )
+    twin_hatch_parser.add_argument("--home", help="override ~/.rapp/twins")
+    twin_hatch_parser.set_defaults(
+        handler=twin_hatch,
+        confirmation_before_context=HATCH_CONFIRMATION_MESSAGE,
+    )
+    twin_list_alias_parser = twin_commands.add_parser(
+        "list",
+        help="list local Twin workspaces",
+    )
+    twin_list_alias_parser.add_argument("--home", help="override ~/.rapp/twins")
+    twin_list_alias_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="include archived and purged twins",
+    )
+    twin_list_alias_parser.set_defaults(handler=twin_list)
+    twin_show_alias_parser = twin_commands.add_parser(
+        "show",
+        help="show one local Twin workspace",
+    )
+    twin_show_alias_parser.add_argument("twin", help="directory id or rappid")
+    twin_show_alias_parser.add_argument("--home", help="override ~/.rapp/twins")
+    twin_show_alias_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="include archived and purged twins",
+    )
+    twin_show_alias_parser.set_defaults(handler=twin_show)
     twin_list_parser = twin_commands.add_parser(
         "legacy-list",
         help="inspect historical ~/.rapp/twins workspaces without claiming canonical status",
@@ -274,7 +318,7 @@ def _parser() -> argparse.ArgumentParser:
         "drive", help="not available until a canonical Twin runtime contract is published"
     )
     twin_drive_parser.add_argument("twin", nargs="?")
-    twin_drive_parser.set_defaults(handler=unavailable_capability)
+    twin_drive_parser.set_defaults(handler=unavailable_capability, capability="twin.drive")
 
     return parser
 
@@ -352,6 +396,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise UsageError("streaming JSON requires --jsonl instead of --json")
         if args.jsonl and not is_stream:
             raise UsageError("--jsonl is only valid for a streaming command")
+        confirmation = getattr(args, "confirmation_before_context", None)
+        if isinstance(confirmation, str) and not getattr(args, "yes", False):
+            raise ConfirmationRequired(confirmation)
         config = Config.load(
             config_path=args.config,
             brainstem_url=args.url,

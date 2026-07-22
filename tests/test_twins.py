@@ -42,6 +42,20 @@ def test_show_twin_rejects_traversal(tmp_path):
         show_twin("../outside", tmp_path)
 
 
+@pytest.mark.parametrize(
+    "rappid",
+    [
+        "rappid:@Owner/slug:" + "a" * 64,
+        "rappid:@owner/slug_name:" + "a" * 64,
+        "rappid:@owner--name/slug:" + "a" * 64,
+        "rappid:@" + "a" * 40 + "/slug:" + "a" * 64,
+    ],
+)
+def test_show_twin_uses_strict_rapp1_parser(rappid, tmp_path):
+    with pytest.raises(UsageError):
+        show_twin(rappid, tmp_path)
+
+
 def test_show_twin_missing_is_typed(tmp_path):
     with pytest.raises(NotFound):
         show_twin("missing", tmp_path)
