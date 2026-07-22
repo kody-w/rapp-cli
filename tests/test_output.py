@@ -31,7 +31,7 @@ def test_json_error_is_one_stdout_document():
 
     payload = json.loads(stdout.getvalue())
     assert payload["error"]["code"] == "REMOTE_FAILED"
-    assert payload["error"]["details"]["path"] == "/tmp/example"
+    assert payload["error"]["details"]["path"] == str(Path("/tmp/example"))
     assert stderr.getvalue() == ""
 
 
