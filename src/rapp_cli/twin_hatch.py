@@ -156,6 +156,8 @@ class HatchOutcome:
 
 def prepare_twin(folder: str | Path) -> PreparedTwin:
     source = Path(folder).expanduser()
+    if not _secure_walk_supported():
+        return _prepare_twin_path_walk(source)
     source_fd, resolved_source, source_info = _open_source_root(source)
     entries: list[TreeEntry] = []
     file_count = 0
@@ -261,6 +263,152 @@ def prepare_twin(folder: str | Path) -> PreparedTwin:
         file_count=file_count,
         total_bytes=total_bytes,
     )
+
+
+def _finish_prepared_twin(
+    source: Path,
+    entries: list[TreeEntry],
+    file_count: int,
+    total_bytes: int,
+) -> PreparedTwin:
+    entries.sort(key=lambda entry: entry.relative_path)
+    files = {
+        entry.relative_path: entry.data
+        for entry in entries
+        if not entry.is_directory and entry.data is not None
+    }
+    directories = {entry.relative_path for entry in entries if entry.is_directory}
+    metadata = _metadata(files.get("rappid.json"))
+    _validate_soul(files.get("soul.md"))
+    if "agents" not in directories:
+        raise UsageError("twin folder requires a root agents/ directory")
+    agents = _agents(files)
+    if not agents:
+        raise UsageError(
+            "twin folder requires at least one immediate regular agents/*_agent.py file"
+        )
+    tree_sha256 = _tree_digest(entries)
+    return PreparedTwin(
+        source=source,
+        rappid=metadata["rappid"],
+        kind=metadata["kind"],
+        identity_hash=metadata["identity_hash"],
+        tree_sha256=tree_sha256,
+        entries=tuple(entries),
+        agents=tuple(agents),
+        file_count=file_count,
+        total_bytes=total_bytes,
+    )
+
+
+def _prepare_twin_path_walk(source: Path) -> PreparedTwin:
+    try:
+        resolved_source = source.resolve(strict=True)
+        root_info = source.lstat()
+        root_reparse = is_reparse_point(source)
+    except FileNotFoundError as exc:
+        raise UsageError(f"twin source does not exist: {source}") from exc
+    except OSError as exc:
+        raise UsageError(f"cannot inspect twin source {source}: {exc}") from exc
+    if (
+        not stat_module.S_ISDIR(root_info.st_mode)
+        or stat_module.S_ISLNK(root_info.st_mode)
+        or root_reparse
+    ):
+        raise IntegrityFailure(f"twin source must be a real non-symlink directory: {source}")
+
+    entries: list[TreeEntry] = []
+    file_count = 0
+    directory_count = 0
+    total_bytes = 0
+
+    def walk(
+        directory: Path,
+        parents: tuple[str, ...],
+        opened_directory_info: os.stat_result,
+    ) -> None:
+        nonlocal directory_count, file_count, total_bytes
+        relative_directory = "/".join(parents)
+        try:
+            before = directory.lstat()
+            if stat_module.S_ISLNK(before.st_mode) or is_reparse_point(directory):
+                raise IntegrityFailure(
+                    f"twin path must not be a symlink or reparse point: {relative_directory or '.'}"
+                )
+            children = [
+                (_relative_component(child.name), child.lstat()) for child in directory.iterdir()
+            ]
+        except IntegrityFailure:
+            raise
+        except OSError as exc:
+            label = relative_directory or "."
+            raise UsageError(f"cannot read twin directory {label}: {exc}") from exc
+        _require_same_inode(before, opened_directory_info, relative_directory or ".")
+        children.sort(key=lambda item: item[0])
+        _after_directory_enumeration(relative_directory)
+        for name, enumerated_info in children:
+            relative_parts = (*parents, name)
+            relative_path = "/".join(relative_parts)
+            child = directory / name
+            _reject_forbidden_path(relative_parts, relative_path)
+            if stat_module.S_ISLNK(enumerated_info.st_mode) or is_reparse_point(child):
+                raise IntegrityFailure(
+                    f"twin path must not be a symlink or reparse point: {relative_path}"
+                )
+            try:
+                opened_info = child.lstat()
+            except OSError as exc:
+                raise UsageError(f"cannot safely open twin path {relative_path}: {exc}") from exc
+            _require_same_inode(enumerated_info, opened_info, relative_path)
+            if stat_module.S_ISDIR(opened_info.st_mode):
+                directory_count += 1
+                if directory_count > MAX_TWIN_DIRECTORIES:
+                    raise UsageError(f"twin exceeds the {MAX_TWIN_DIRECTORIES} directory limit")
+                entries.append(TreeEntry(relative_path, None))
+                walk(child, relative_parts, opened_info)
+                continue
+            if not stat_module.S_ISREG(opened_info.st_mode):
+                raise IntegrityFailure(
+                    f"twin path must be a regular file or directory: {relative_path}"
+                )
+            file_count += 1
+            if file_count > MAX_TWIN_FILES:
+                raise UsageError(f"twin exceeds the {MAX_TWIN_FILES} file limit")
+            payload = _read_path_file_no_follow(child, opened_info, relative_path)
+            total_bytes += len(payload)
+            if total_bytes > MAX_TWIN_TOTAL_BYTES:
+                raise UsageError(
+                    f"twin exceeds the {MAX_TWIN_TOTAL_BYTES} byte total payload limit"
+                )
+            entries.append(TreeEntry(relative_path, payload))
+        after = directory.lstat()
+        _require_unchanged_directory(before, after, relative_directory or ".")
+
+    walk(source, (), root_info)
+    return _finish_prepared_twin(resolved_source, entries, file_count, total_bytes)
+
+
+def _read_path_file_no_follow(path: Path, opened_info: os.stat_result, relative_path: str) -> bytes:
+    if opened_info.st_size > MAX_TWIN_FILE_BYTES:
+        raise UsageError(
+            f"twin file {relative_path} exceeds the {MAX_TWIN_FILE_BYTES} byte per-file limit"
+        )
+    try:
+        with path.open("rb") as handle:
+            current = os.fstat(handle.fileno())
+            _require_same_inode(opened_info, current, relative_path)
+            if not stat_module.S_ISREG(current.st_mode):
+                raise IntegrityFailure(f"twin path changed while opening: {relative_path}")
+            data = handle.read(MAX_TWIN_FILE_BYTES + 1)
+    except IntegrityFailure:
+        raise
+    except OSError as exc:
+        raise UsageError(f"cannot read twin file {relative_path}: {exc}") from exc
+    if len(data) > MAX_TWIN_FILE_BYTES:
+        raise UsageError(
+            f"twin file {relative_path} exceeds the {MAX_TWIN_FILE_BYTES} byte per-file limit"
+        )
+    return data
 
 
 def hatch_twin(
@@ -578,9 +726,32 @@ def _ensure_control_directory(home: Path, name: str) -> Path:
 @contextlib.contextmanager
 def _identity_lock(home: Path, identity_hash: str) -> Iterator[None]:
     if os.name != "posix":
-        raise CapabilityUnavailable(
-            "secure advisory Twin hatch locking is unavailable on this platform"
-        )
+        locks = _ensure_control_directory(home, ".locks")
+        lock_directory = locks / f"{identity_hash}.lockdir"
+        try:
+            lock_directory.mkdir(mode=0o700)
+        except FileExistsError as exc:
+            raise Conflict(
+                f"another rapp-cli hatch is already running for {identity_hash}"
+            ) from exc
+        except OSError as exc:
+            raise UsageError(f"cannot create Twin hatch lock {lock_directory}: {exc}") from exc
+        try:
+            info = lock_directory.lstat()
+            if (
+                not stat_module.S_ISDIR(info.st_mode)
+                or stat_module.S_ISLNK(info.st_mode)
+                or is_reparse_point(lock_directory)
+            ):
+                raise IntegrityFailure(
+                    f"Twin hatch lock must be a real non-symlink directory: {lock_directory}"
+                )
+            _fsync_directory(locks)
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                lock_directory.rmdir()
+        return
     import fcntl
 
     locks = _ensure_control_directory(home, ".locks")

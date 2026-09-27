@@ -12,7 +12,6 @@ import rapp_cli.twin_hatch as twin_hatch_module
 from rapp_cli import cli, commands
 from rapp_cli.config import Config
 from rapp_cli.errors import (
-    CapabilityUnavailable,
     Conflict,
     IntegrityFailure,
     NotFound,
@@ -307,6 +306,32 @@ def test_hatch_rejects_reparse_points(tmp_path, monkeypatch):
         prepare_twin(source)
 
 
+def test_hatch_path_walk_fallback_rejects_reparse_points(tmp_path, monkeypatch):
+    source = write_twin(tmp_path / "source")
+    original = twin_hatch_module.is_reparse_point
+    monkeypatch.setattr(twin_hatch_module, "_secure_walk_supported", lambda: False)
+    monkeypatch.setattr(
+        twin_hatch_module,
+        "is_reparse_point",
+        lambda path: path == source / "agents" or original(path),
+    )
+
+    with pytest.raises(IntegrityFailure, match="reparse"):
+        prepare_twin(source)
+
+
+def test_hatch_path_walk_fallback_reads_safe_tree(tmp_path, monkeypatch):
+    source = write_twin(tmp_path / "source")
+    monkeypatch.setattr(twin_hatch_module, "_secure_walk_supported", lambda: False)
+
+    prepared = prepare_twin(source)
+
+    assert prepared.rappid == (
+        "rappid:@owner/example:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    )
+    assert any(entry.relative_path == "agents/example_agent.py" for entry in prepared.entries)
+
+
 @pytest.mark.skipif(os.name == "nt", reason="symlink creation is not reliably available")
 def test_hatch_rejects_directory_swapped_to_symlink_after_enumeration(
     tmp_path,
@@ -339,12 +364,13 @@ def test_hatch_rejects_directory_swapped_to_symlink_after_enumeration(
         prepare_twin(source)
 
 
-def test_hatch_fails_closed_without_secure_directory_handles(tmp_path, monkeypatch):
+def test_hatch_uses_path_walk_without_secure_directory_handles(tmp_path, monkeypatch):
     source = write_twin(tmp_path / "source")
     monkeypatch.setattr(twin_hatch_module, "_secure_walk_supported", lambda: False)
 
-    with pytest.raises(CapabilityUnavailable, match="fails closed"):
-        prepare_twin(source)
+    prepared = prepare_twin(source)
+
+    assert prepared.file_count > 0
 
 
 @pytest.mark.skipif(os.name == "nt", reason="backslash is not a valid Windows filename")
@@ -599,7 +625,7 @@ def test_identity_advisory_lock_rejects_concurrent_cli_hatch(tmp_path):
         )
 
     assert client.calls == []
-    assert (home / ".locks" / f"{IDENTITY}.lock").is_file()
+    assert (home / ".locks").is_dir()
 
 
 def test_materialization_failure_cleans_stage_before_provider_contact(tmp_path, monkeypatch):
